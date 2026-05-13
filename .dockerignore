@@ -1,0 +1,11 @@
+node_modules
+.next
+.git
+.env
+*.log
+evidencia_*.png
+video_info_*.txt
+dynamic_test_*.spec.js
+test-results/
+public/evidences/*
+!public/evidences/.gitkeep
