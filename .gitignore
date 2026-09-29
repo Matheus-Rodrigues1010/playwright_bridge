@@ -39,3 +39,11 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# artefatos de execução
+video_info_*.txt
+evidencia_*.png
+/test-results/
+/playwright-report/
+/public/evidences/
+/data/

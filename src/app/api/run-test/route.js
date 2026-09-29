@@ -3,59 +3,33 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import fs from 'fs/promises';
 import path from 'path';
+import { classifyStep, maskPassword } from '@/lib/steps';
+import { authorized, unauthorized } from '@/lib/auth';
+import { addRun } from '@/lib/history';
 
 const execAsync = promisify(exec);
 
 export async function POST(request) {
+  if (!authorized(request)) return unauthorized();
   try {
-    const { url, steps } = await request.json();
+    const { url, steps, source } = await request.json();
 
-    if (!url || !steps || steps.length === 0) {
-      return NextResponse.json({ success: false, error: 'URL e passos são obrigatórios.' }, { status: 400 });
+    if (!/^https?:\/\//i.test(url || '') || !Array.isArray(steps) || steps.length === 0) {
+      return NextResponse.json({ success: false, error: 'URL (http/https) e passos são obrigatórios.' }, { status: 400 });
     }
 
     // Gerar o código do teste dinâmico
     const testId = Date.now();
     const tempTestFile = path.join(process.cwd(), `dynamic_test_${testId}.spec.js`);
     const evidenceFile = path.join(process.cwd(), `evidencia_${testId}.png`);
-    const videoInfoFile = path.join(process.cwd(), `video_info_${testId}.txt`);
+    const videoFile = path.join(process.cwd(), 'public', 'evidences', `video_${testId}.webm`);
 
-    // ========== DETECÇÃO INTELIGENTE DE PADRÕES ==========
-    
-    // Detecta credenciais de login
-    function extractLogin(text) {
-      const match = text.match(/usu[aá]rio\s+["']([^"']+)["']\s+e\s+senha\s+["']([^"']+)["']/i);
-      if (match) return { user: match[1], pass: match[2] };
-      return null;
-    }
-    
-    // Detecta "busque/pesquise/digite por X no campo"
-    function extractSearch(text) {
-      const match = text.match(/(?:busque|pesquise|procure|digite|filtre)\s+(?:por\s+)?["']([^"']+)["']/i);
-      if (match) return match[1];
-      return null;
-    }
-    
-    // Detecta "clique no texto/botão/link X"
-    function extractClickText(text) {
-      const match = text.match(/clique\s+(?:n[oa]\s+)?(?:texto|bot[aã]o|link|op[cç][aã]o)?\s*["']([^"']+)["']/i);
-      if (match) return match[1];
-      return null;
-    }
-    
-    // Detecta "verifique se a tela/página X está sendo exibida"
-    function extractVerifyUrl(text) {
-      const match = text.match(/verifique\s+se\s+.*?(\/\w[\w/]*)/i);
-      if (match) return match[1];
-      return null;
-    }
-
-    // Detecta intenção de gerar um CPF válido e o nome do campo (opcional)
-    function extractCpfGen(text) {
-      const match = text.match(/cpf\s+v[aá]lido(?:.*?campo\s+["']([^"']+)["']|.*?em\s+["']([^"']+)["'])?/i);
-      if (match) return match[1] || match[2] || "cpf";
-      return null;
-    }
+    // "{{QA_X}}" → process.env.QA_X lido pelo spec em execução: o valor real não entra no código gerado,
+    // no log nem na resposta. Só QA_* para um passo não conseguir digitar outras chaves do .env num site.
+    const valueExpr = v => {
+      const m = v.match(/^\{\{(QA_[A-Z0-9_]+)\}\}$/);
+      return m ? `envValue(${JSON.stringify(m[1])})` : JSON.stringify(v);
+    };
 
     function generateValidCPF() {
       const randomDigit = () => Math.floor(Math.random() * 10);
@@ -72,13 +46,48 @@ export async function POST(request) {
     let stepsCode = '';
     steps.forEach((step, index) => {
       const stepEvidencePath = path.join(process.cwd(), `evidencia_${testId}_${index}.png`);
-      const login = extractLogin(step);
-      const searchTerm = !login ? extractSearch(step) : null;
-      const clickText = !login && !searchTerm ? extractClickText(step) : null;
-      const verifyUrl = !login && !searchTerm && !clickText ? extractVerifyUrl(step) : null;
-      const cpfField = !login && !searchTerm && !clickText && !verifyUrl ? extractCpfGen(step) : null;
-      
-      if (login) {
+      const s = classifyStep(step);
+
+      if (s.kind === 'select') {
+        // ===== SELEÇÃO NATIVA EM LISTA/AUTOCOMPLETE (0 créditos) =====
+        stepsCode += `
+    await test.step('Passo ${index + 1} - Seleção', async () => {
+      try {
+        const f = ${JSON.stringify(s.field)}, v = ${valueExpr(s.value)};
+        // Label ligado ao input, ou o input do menor bloco que contém o texto do label (labels sem "for")
+        const byBlock = page.locator('div').filter({ has: page.getByText(f) }).filter({ has: page.locator('input:visible, select:visible') }).last().locator('input:visible, select:visible').first();
+        const field = page.getByLabel(f).or(page.getByPlaceholder(f)).or(page.getByRole('combobox', { name: f })).first().or(byBlock).first();
+        await field.click({ timeout: 10000 });
+        if (await field.evaluate(e => e.tagName === 'SELECT')) {
+          await field.selectOption({ label: v });
+        } else {
+          await field.fill(v);
+          await page.getByRole('option', { name: v }).or(page.getByText(v, { exact: true })).first().click({ timeout: 10000 });
+        }
+        await page.waitForTimeout(1000);
+      } finally {
+        try {
+          await page.screenshot({ path: ${JSON.stringify(stepEvidencePath)}, fullPage: true });
+        } catch (e) { console.error("Falha evidencia", e); }
+      }
+    });\n`;
+
+      } else if (s.kind === 'verifyText') {
+        // ===== VERIFICAÇÃO DE TEXTO/TÍTULO NATIVA (0 créditos) =====
+        stepsCode += `
+    await test.step('Passo ${index + 1} - Verificação', async () => {
+      try {
+        ${s.title
+          ? `await expect.poll(() => page.title(), { timeout: 15000 }).toContain(${JSON.stringify(s.value)});`
+          : `await expect(page.getByText(${JSON.stringify(s.value)}).first()).toBeVisible({ timeout: 15000 });`}
+      } finally {
+        try {
+          await page.screenshot({ path: ${JSON.stringify(stepEvidencePath)}, fullPage: true });
+        } catch (e) { console.error("Falha evidencia", e); }
+      }
+    });\n`;
+
+      } else if (s.kind === 'login') {
         // ===== LOGIN NATIVO (0 créditos) =====
         stepsCode += `
     await test.step('Passo ${index + 1} - Login', async () => {
@@ -88,18 +97,24 @@ export async function POST(request) {
         const emailField = page.locator('input[type="email"], input[type="text"], input[name*="user" i], input[name*="email" i], input[name*="login" i], input[placeholder*="email" i], input[placeholder*="usu" i], input[placeholder*="acesso" i]').first();
         await emailField.waitFor({ state: 'visible', timeout: 15000 });
         await emailField.click();
-        await emailField.fill(${JSON.stringify(login.user)});
+        await emailField.fill(${valueExpr(s.user)});
         
         const passField = page.locator('input[type="password"]').first();
         await passField.waitFor({ state: 'visible', timeout: 5000 });
         await passField.click();
-        await passField.fill(${JSON.stringify(login.pass)});
+        await passField.fill(${valueExpr(s.pass)});
         
         const submitBtn = page.locator('button[type="submit"], button:has-text("Entrar"), button:has-text("Login"), button:has-text("Acessar"), button:has-text("Avançar"), button:has-text("Sign in"), button:has-text("Continuar")').first();
         await submitBtn.click();
-        
+
         await page.waitForLoadState('domcontentloaded').catch(() => {});
         await page.waitForTimeout(3000);
+
+${index === steps.length - 1 ? `
+        // Formulário ainda na tela (ex: campo extra "escola") e nenhum passo seguinte → Claude conclui o login.
+        if (await passField.isVisible().catch(() => false)) {
+          await ai('O login foi iniciado mas não concluído. Preencha os campos obrigatórios que faltam (em listas, escolha a primeira opção disponível), sem alterar usuário e senha, clique no botão de avançar/entrar e confirme que saiu da tela de login.', aiArgs);
+        }` : ''}
       } finally {
         try {
           await page.waitForTimeout(1000);
@@ -108,7 +123,7 @@ export async function POST(request) {
       }
     });\n`;
 
-      } else if (searchTerm) {
+      } else if (s.kind === 'search') {
         // ===== BUSCA NATIVA (0 créditos) =====
         stepsCode += `
     await test.step('Passo ${index + 1} - Busca', async () => {
@@ -143,7 +158,7 @@ export async function POST(request) {
         
         if (searchField) {
           await searchField.click();
-          await searchField.fill(${JSON.stringify(searchTerm)});
+          await searchField.fill(${valueExpr(s.term)});
           await page.waitForTimeout(2000);
         } else {
           throw new Error('Não foi possível encontrar o campo de busca na página.');
@@ -156,7 +171,7 @@ export async function POST(request) {
       }
     });\n`;
 
-      } else if (clickText) {
+      } else if (s.kind === 'click') {
         // ===== CLIQUE EM TEXTO NATIVO (0 créditos) =====
         stepsCode += `
     await test.step('Passo ${index + 1} - Clique', async () => {
@@ -164,7 +179,7 @@ export async function POST(request) {
         await page.waitForLoadState('domcontentloaded').catch(() => {});
         await page.waitForTimeout(1000);
         
-        const target = page.locator('text=${clickText.replace(/'/g, "\\'")}').first();
+        const target = page.getByText(${JSON.stringify(s.text)}).first();
         await target.waitFor({ state: 'visible', timeout: 10000 });
         await target.scrollIntoViewIfNeeded();
         await target.click();
@@ -179,7 +194,7 @@ export async function POST(request) {
       }
     });\n`;
 
-      } else if (verifyUrl) {
+      } else if (s.kind === 'verifyUrl') {
         // ===== VERIFICAÇÃO DE URL NATIVA (0 créditos) =====
         stepsCode += `
     await test.step('Passo ${index + 1} - Verificação', async () => {
@@ -187,8 +202,8 @@ export async function POST(request) {
         await page.waitForTimeout(3000);
         
         const currentUrl = page.url();
-        if (!currentUrl.includes(${JSON.stringify(verifyUrl)})) {
-          throw new Error('Esperava URL contendo "${verifyUrl}" mas encontrou: ' + currentUrl);
+        if (!currentUrl.includes(${JSON.stringify(s.path)})) {
+          throw new Error(${JSON.stringify(`Esperava URL contendo "${s.path}" mas encontrou: `)} + currentUrl);
         }
       } finally {
         try {
@@ -198,7 +213,7 @@ export async function POST(request) {
       }
     });\n`;
 
-      } else if (cpfField) {
+      } else if (s.kind === 'cpf') {
         // ===== GERAÇÃO DE CPF VÁLIDO (0 créditos + fallback IA) =====
         const generatedCpf = generateValidCPF();
         stepsCode += `
@@ -207,7 +222,8 @@ export async function POST(request) {
         await page.waitForLoadState('domcontentloaded').catch(() => {});
         await page.waitForTimeout(1000);
         
-        const targetField = page.locator(\`input[placeholder*="\${'${cpfField}'}" i], input[name*="\${'${cpfField}'}" i], input[id*="\${'${cpfField}'}" i]\`).first();
+        const f = ${JSON.stringify(s.field)};
+        const targetField = page.locator(\`input[placeholder*="\${f}" i], input[name*="\${f}" i], input[id*="\${f}" i]\`).first();
         
         if (await targetField.isVisible().catch(() => false)) {
           await targetField.scrollIntoViewIfNeeded();
@@ -220,7 +236,7 @@ export async function POST(request) {
         }
       } catch (e) {
         // Fallback: Usa o ZeroStep IA para preencher o CPF *já gerado*, garantindo a matemática correta
-        await ai(\`Preencha exatamente o valor "${generatedCpf}" no campo ${cpfField}\`, aiArgs);
+        await ai(${JSON.stringify(`Preencha exatamente o valor "${generatedCpf}" no campo ${s.field}`)}, aiArgs);
       } finally {
         try {
           await page.waitForTimeout(1000);
@@ -249,9 +265,15 @@ export async function POST(request) {
 
     const specContent = `
 import { test, expect } from '@playwright/test';
-import { ai } from '@zerostep/playwright';
+import { ai } from './src/lib/claude-ai.js';
 import dotenv from 'dotenv';
-dotenv.config();
+// quiet: o aviso do dotenv saía antes do erro real e o escondia no log
+dotenv.config({ quiet: true });
+
+const envValue = name => {
+  if (!process.env[name]) throw new Error('Variável ' + name + ' não definida no .env do runner.');
+  return process.env[name];
+};
 
 test.use({ 
   video: { mode: 'on', size: { width: 1280, height: 720 } },
@@ -269,10 +291,7 @@ test.afterEach(async ({ page }, testInfo) => {
     const videoObj = page.video();
     await page.close();
     
-    if (videoObj) {
-      const videoPath = await videoObj.path();
-      require('fs').writeFileSync(${JSON.stringify(videoInfoFile)}, videoPath, 'utf8');
-    }
+    if (videoObj) await videoObj.saveAs(${JSON.stringify(videoFile)});
   } catch (e) {
     console.error("Falha ao gerar evidencia no afterEach", e);
   }
@@ -283,15 +302,9 @@ test('Execucao dinamica do painel', async ({ page }) => {
   const aiArgs = { page, test };
 
   await test.step('Acessar URL Base', async () => {
-    await page.goto('${url}', { waitUntil: 'domcontentloaded' });
+    await page.goto(${JSON.stringify(url)}, { waitUntil: 'domcontentloaded' });
   });
   ${stepsCode}
-  // Passo de relatório removido: O ZeroStep cobraria 1 crédito adicional só para gerar esse texto. 
-  // Alterado para um log fixo para economia extrema.
-  await test.step('Gerar Relatorio Natural', async () => {
-    const relatorio = 'Teste executado. Para visualizar os resultados, olhe a evidência visual logo abaixo.';
-    console.log('AI_REPORT_START\\n' + relatorio + '\\nAI_REPORT_END');
-  });
 });
 `;
 
@@ -305,63 +318,35 @@ test('Execucao dinamica do painel', async ({ page }) => {
     try {
       // Usar apenas o nome do arquivo para evitar bugs do Playwright com caminhos absolutos no Windows
       const testFileName = path.basename(tempTestFile);
-      const { stdout, stderr } = await execAsync("npx playwright test " + testFileName);
-      commandOutput = stdout + '\\n' + stderr;
+      const { stdout, stderr } = await execAsync("npx playwright test " + testFileName, { env: { ...process.env, FORCE_COLOR: '0' } });
+      commandOutput = stdout + '\n' + stderr;
     } catch (error) {
       // O teste falhou
       success = false;
-      commandOutput = error.stdout + '\\n' + error.stderr + '\\n' + error.message;
+      commandOutput = error.stdout + '\n' + error.stderr + '\n' + error.message;
     }
+    // FORCE_COLOR=0 não cobre as mensagens do expect; remove cores ANSI para log, histórico e ClickUp
+    commandOutput = commandOutput.replace(/\x1b\[[0-9;]*m/g, '');
 
-    // Extrair o relatório natural
-    let naturalReport = null;
-    const reportMatch = commandOutput.match(/AI_REPORT_START\n([\s\S]*?)\nAI_REPORT_END/);
-    if (reportMatch) {
-      naturalReport = reportMatch[1].trim();
-    }
+    // O afterEach salva o vídeo direto em public/evidences
+    const videoUrl = await fs.access(videoFile).then(() => `/evidences/${path.basename(videoFile)}`, () => null);
 
-    // Extrair o vídeo gerado de forma robusta via arquivo temporário
-    let videoUrl = null;
-    try {
-      const originalVideoPath = await fs.readFile(videoInfoFile, 'utf8');
-      if (originalVideoPath) {
-        const publicVideoDir = path.join(process.cwd(), 'public', 'evidences');
-        await fs.mkdir(publicVideoDir, { recursive: true });
-        
-        const newVideoName = `video_${testId}.webm`;
-        const newVideoPath = path.join(publicVideoDir, newVideoName);
-        
-        await fs.copyFile(originalVideoPath.trim(), newVideoPath);
-        videoUrl = `/evidences/${newVideoName}`;
-      }
-      await fs.unlink(videoInfoFile); // limpar temporário
-    } catch (e) {
-      // Arquivo de vídeo não encontrado ou falha ao copiar
-    }
-
-    // Tentar ler as evidências
-    let evidencesBase64 = [];
-
-    // Ler evidências de cada passo
-    for (let i = 0; i < steps.length; i++) {
-      const stepEvidencePath = path.join(process.cwd(), `evidencia_${testId}_${i}.png`);
+    // Lê e apaga um print; null se o passo não chegou a rodar
+    const takeEvidence = async file => {
       try {
-        const imageBuffer = await fs.readFile(stepEvidencePath);
-        evidencesBase64.push(imageBuffer.toString('base64'));
-        await fs.unlink(stepEvidencePath);
-      } catch (e) {
-        // ignora
-      }
-    }
+        const b64 = (await fs.readFile(file)).toString('base64');
+        await fs.unlink(file);
+        return b64;
+      } catch { return null; }
+    };
+    // Alinhado por índice do passo
+    const stepEvidences = await Promise.all(steps.map((_, i) => takeEvidence(path.join(process.cwd(), `evidencia_${testId}_${i}.png`))));
+    const finalEvidence = await takeEvidence(evidenceFile);
 
-    // Ler evidência final do afterEach (capturada em falhas ou no final)
-    try {
-      const imageBuffer = await fs.readFile(evidenceFile);
-      evidencesBase64.push(imageBuffer.toString('base64'));
-      await fs.unlink(evidenceFile);
-    } catch (e) {
-      // console.error("Evidência final não encontrada:", e);
-    }
+    // Ex: "1) dynamic_test_x.spec.js:29:5 › Execucao dinamica do painel › Passo 2 - Clique ───"
+    const failedStepMatch = !success && commandOutput.match(/› Passo (\d+) -/);
+    const failedStep = failedStepMatch ? Number(failedStepMatch[1]) : null;
+    const errorSummary = success ? null : (commandOutput.match(/^\s*(\w*Error: .+)$/m)?.[1] || 'O teste falhou ou estourou o tempo limite.').trim();
 
     // Limpar o arquivo de teste
     try {
@@ -370,13 +355,29 @@ test('Execucao dinamica do painel', async ({ page }) => {
       // Ignorar
     }
 
+    // Histórico: senha mascarada; prints não são guardados (a gravação cobre a evidência visual)
+    await addRun({
+      id: testId,
+      at: new Date(testId).toISOString(),
+      source: source === 'ui' ? 'interface' : 'n8n',
+      url,
+      steps: steps.map(maskPassword),
+      success,
+      failedStep,
+      error: errorSummary,
+      durationMs: Date.now() - testId,
+      videoUrl,
+      evidenced: stepEvidences.map(Boolean),
+    }).catch(e => console.error('Falha ao salvar histórico', e));
+
     return NextResponse.json({
       success,
       output: commandOutput,
-      naturalReport,
-      evidencesBase64,
+      stepEvidences,
+      finalEvidence,
+      failedStep,
       videoUrl,
-      error: success ? null : commandOutput
+      error: errorSummary
     });
 
   } catch (error) {
