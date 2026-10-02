@@ -1,6 +1,6 @@
 'use client';
 import { useEffect, useRef, useState } from 'react';
-import { classifyStep, maskPassword, splitSteps, STEP_LABELS, TEMPLATES } from '@/lib/steps';
+import { classifyStep, DEFAULT_LOGIN_STEP, NEEDS_DATA, prettyStep, splitSteps, STEP_LABELS, TEMPLATES } from '@/lib/steps';
 
 const URL_PRESETS = [
   { label: 'QA Hub', value: 'https://qa-hub.educacional.com/' },
@@ -8,6 +8,8 @@ const URL_PRESETS = [
   { label: 'Outro endereço', value: '' },
 ];
 
+const MAX_AI_STEPS = 10;
+const SCENARIO_STATUS = { ready: 'Pronto', needs_data: 'Precisa de dados', unsupported: 'Não suportado' };
 const fmtTime = s => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
 
@@ -21,6 +23,7 @@ function fmtWhen(iso) {
 
 // Traduz os erros mais comuns para algo que dá para agir; o detalhe técnico continua visível abaixo.
 function friendlyError(error = '') {
+  if (/Sem permissão nesta página/.test(error)) return 'O usuário de teste não tem permissão para essa página. Use um usuário com o perfil certo (ex.: professor ou administrador) em QA_USER/QA_PASS.';
   if (/Não autorizado/.test(error)) return 'Falta o token de acesso. Informe em "Configurações de acesso".';
   if (/Could not resolve authentication|ANTHROPIC_API_KEY/.test(error)) return 'Esse passo precisou de IA, mas a chave da Anthropic não está configurada no servidor.';
   if (/ERR_NAME_NOT_RESOLVED|ERR_CONNECTION/.test(error)) return 'Não consegui abrir esse endereço. Confira se a URL está certa.';
@@ -61,6 +64,12 @@ export default function Dashboard() {
   const [historyFilter, setHistoryFilter] = useState('todos');
   const [openRun, setOpenRun] = useState(null);
   const [gen, setGen] = useState({ loading: false, warnings: [], error: null, previous: null });
+  // História com vários cenários: lista para escolher; pathText vai antes de cada um (login + caminho até a tela)
+  const [scenarios, setScenarios] = useState(null);
+  const [activeScenario, setActiveScenario] = useState(null);
+  const [pathText, setPathText] = useState(() => {
+    try { return localStorage.getItem('scenarioPath') ?? DEFAULT_LOGIN_STEP; } catch { return DEFAULT_LOGIN_STEP; }
+  });
 
   // Token: lido do campo na hora de enviar; localStorage só lembra neste navegador. A API valida.
   const tokenRef = useRef(null);
@@ -97,6 +106,9 @@ export default function Dashboard() {
 
   const steps = splitSteps(freeText);
   const aiCount = steps.filter(s => classifyStep(s).kind === 'ai').length;
+  // Texto colado de história/spec vira dezenas de "passos" de IA: cada um custa uma execução do Claude
+  const tooManyAi = aiCount > MAX_AI_STEPS;
+  const pendingData = steps.filter(s => NEEDS_DATA.test(s)).length;
 
   useEffect(() => {
     if (status !== 'running') return;
@@ -117,11 +129,28 @@ export default function Dashboard() {
       });
       const data = await res.json();
       if (!res.ok) return setGen({ loading: false, warnings: [], error: data.error, previous: null });
+      if (data.scenarios.length > 1) {
+        setGen({ loading: false, warnings: data.warnings, error: null, previous: null });
+        setScenarios(data.scenarios);
+        setActiveScenario(null);
+        return;
+      }
       setGen({ loading: false, warnings: data.warnings, error: null, previous: freeText });
       setFreeText(data.steps.join('\n'));
     } catch (err) {
       setGen({ loading: false, warnings: [], error: `Erro de rede: ${err.message}`, previous: null });
     }
+  };
+
+  const savePath = t => {
+    setPathText(t);
+    try { localStorage.setItem('scenarioPath', t); } catch {}
+  };
+
+  const loadScenario = (sc, i) => {
+    setGen(g => ({ ...g, previous: g.previous ?? freeText }));
+    setFreeText([...splitSteps(pathText), ...sc.steps].join('\n'));
+    setActiveScenario(i);
   };
 
   const undoGenerate = () => {
@@ -161,7 +190,7 @@ export default function Dashboard() {
   const shots = result ? [...ranSteps.map((_, i) => result.stepEvidences?.[i]), result.finalEvidence] : [];
   const shotLabel = i => (i === ranSteps.length ? 'Tela final' : `Passo ${i + 1} · ${STEP_LABELS[classifyStep(ranSteps[i]).kind]}`);
   const passedCount = result ? ranSteps.filter((_, i) => stepStatus(result, i) === 'passed').length : 0;
-  const failedText = result?.failedStep ? maskPassword(ranSteps[result.failedStep - 1] || '') : null;
+  const failedText = result?.failedStep ? prettyStep(ranSteps[result.failedStep - 1] || '') : null;
 
   return (
     <div className="container">
@@ -203,12 +232,48 @@ export default function Dashboard() {
               </button>
               {gen.previous !== null && <button type="button" className="chip" onClick={undoGenerate}>↶ Voltar ao meu texto</button>}
             </div>
-            <p className="hint">Escreveu do seu jeito? A IA reorganiza nos formatos que o robô entende, e você revisa antes de rodar. Senhas não saem daqui.</p>
+            <p className="hint">Escreveu do seu jeito? A IA reorganiza nos formatos que o robô entende, e você revisa antes de rodar. Senhas não saem daqui. Para entrar com o usuário de teste padrão, basta escrever <strong>faça login</strong>.</p>
             {gen.error && <ErrorExplained error={gen.error} />}
             {gen.warnings.length > 0 && (
               <div className="gen-warnings">
                 <strong>O que eu ajustei:</strong>
                 <ul>{gen.warnings.map((w, i) => <li key={i}>{w}</li>)}</ul>
+              </div>
+            )}
+
+            {scenarios && (
+              <div className="scenarios">
+                <div className="scenarios-head">
+                  <strong>Encontrei {scenarios.length} cenários</strong>
+                  <button type="button" className="chip" onClick={() => setScenarios(null)}>Fechar</button>
+                </div>
+                <p className="hint">
+                  {[['ready', 'pronto', 'prontos'], ['needs_data', 'precisa de dados', 'precisam de dados'], ['unsupported', 'não suportado', 'não suportados']].map(([k, one, many]) => plural(scenarios.filter(sc => sc.status === k).length, one, many)).join(' · ')}. Escolha um para carregar no campo acima.
+                </p>
+
+                <label htmlFor="scenario-path" className="label-spaced">Antes de cada cenário</label>
+                <textarea id="scenario-path" rows={3} value={pathText} onChange={e => savePath(e.target.value)} />
+                <p className="hint">Login e o caminho até a tela do cenário, um passo por linha. Ex.: Clique em &quot;Avaliações&quot;, depois Clique em &quot;Banco de Questões&quot;.</p>
+
+                <ol className="scenario-list">
+                  {scenarios.map((sc, i) => (
+                    <li key={i} className={`scenario-card ${sc.status} ${activeScenario === i ? 'active' : ''}`}>
+                      <div className="scenario-top">
+                        <strong>{sc.title}</strong>
+                        <span className={`tag tag-${sc.status}`}>{SCENARIO_STATUS[sc.status]}</span>
+                      </div>
+                      {sc.steps.length > 0 && (
+                        <ol className="scenario-steps">{sc.steps.map((st, j) => <li key={j}>{prettyStep(st)}</li>)}</ol>
+                      )}
+                      {sc.notes.map((n, j) => <p key={j} className="hint">{n}</p>)}
+                      {sc.status !== 'unsupported' && (
+                        <button type="button" className="btn btn-secondary" onClick={() => loadScenario(sc, i)}>
+                          {activeScenario === i ? 'Carregado ✓' : 'Usar este cenário'}
+                        </button>
+                      )}
+                    </li>
+                  ))}
+                </ol>
               </div>
             )}
 
@@ -221,6 +286,20 @@ export default function Dashboard() {
               </div>
             </details>
           </div>
+
+          {pendingData > 0 && (
+            <div className="gen-warnings">
+              <strong>Falta completar {pendingData === 1 ? '1 passo' : `${pendingData} passos`}.</strong>
+              <p>Troque os trechos <code>[informe: …]</code> no campo de passos pelo valor real antes de rodar.</p>
+            </div>
+          )}
+
+          {tooManyAi && (
+            <div className="gen-warnings">
+              <strong>Isso parece uma história ou especificação, não um roteiro.</strong>
+              <p>{aiCount} linhas iriam para a IA, uma por uma. Clique em <strong>✨ Organizar com IA</strong> ou escreva só as ações, uma por linha.</p>
+            </div>
+          )}
 
           {steps.length > 0 && (
             <div className="preview">
@@ -236,7 +315,7 @@ export default function Dashboard() {
                   return (
                     <li key={i} className="step-row">
                       <span className="step-number">{i + 1}</span>
-                      <span className="step-text">{maskPassword(s)}</span>
+                      <span className="step-text">{prettyStep(s)}</span>
                       <span className={kind === 'ai' ? 'tag tag-ai' : 'tag tag-native'}>{kind === 'ai' ? 'IA' : STEP_LABELS[kind]}</span>
                     </li>
                   );
@@ -260,7 +339,7 @@ export default function Dashboard() {
             <p className="hint">Fica guardado só neste navegador.</p>
           </details>
 
-          <button className="btn btn-primary" onClick={handleRunTest} disabled={status === 'running' || !steps.length}>
+          <button className="btn btn-primary" onClick={handleRunTest} disabled={status === 'running' || !steps.length || tooManyAi || pendingData > 0}>
             {status === 'running' ? `Testando… ${fmtTime(elapsed)}` : 'Começar o teste'}
           </button>
           <p className="hint center">ou <kbd>Ctrl</kbd> + <kbd>Enter</kbd> no campo de passos</p>
@@ -325,7 +404,7 @@ export default function Dashboard() {
                     <li key={i}>
                       <button type="button" className={`timeline-item ${st} ${selected === i ? 'active' : ''}`} onClick={() => setSelected(i)}>
                         <span className={`status-dot ${st}`} aria-label={STATUS_LABEL[st]}>{STATUS_ICON[st]}</span>
-                        <span className="step-text">{maskPassword(s)}</span>
+                        <span className="step-text">{prettyStep(s)}</span>
                         {shots[i] && <img src={`data:image/png;base64,${shots[i]}`} alt="" className="thumb" />}
                       </button>
                     </li>
@@ -397,7 +476,7 @@ export default function Dashboard() {
                       {run.steps.map((s, i) => (
                         <li key={i} className="timeline-item static">
                           <span className={`status-dot ${st(i)}`} aria-label={STATUS_LABEL[st(i)]}>{STATUS_ICON[st(i)]}</span>
-                          <span className="step-text">{s}</span>
+                          <span className="step-text">{prettyStep(s)}</span>
                         </li>
                       ))}
                     </ol>

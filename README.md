@@ -72,3 +72,30 @@ Preencha os campos de login com usuário "{{QA_USER}}" e senha "{{QA_PASS}}" e c
 ```
 
 Vale para usuário, senha, busca e seleção. O valor real não entra no código gerado, no log, na resposta da API nem no histórico. Só variáveis com prefixo `QA_` são resolvidas; se faltar alguma, o passo falha com "Variável QA_X não definida".
+
+### Login padrão
+
+Escrever só `faça login` (ou `faço o login`, `efetue o login`) usa `QA_USER`/`QA_PASS` do `.env`. O gerador com IA faz o mesmo quando o roteiro pede login sem informar credenciais. Se o site pedir escola depois do usuário e senha, defina `QA_ESCOLA` no `.env` e o login padrão a escolhe sozinho. No login por e-mail o campo de escola não aparece, e esse passo é pulado automaticamente, mesmo com `QA_ESCOLA` definido.
+
+### Histórias de usuário com vários cenários
+
+Colou uma história com critérios de aceite ("Cenário 1 — …", Dado/Quando/Então)? O **✨ Organizar com IA** separa cada cenário e marca o status: **Pronto**, **Precisa de dados** (os valores que faltam aparecem como `[informe: …]` e o botão de rodar fica bloqueado até você preencher) ou **Não suportado** (cenários com upload/importação ou download/exportação de arquivo). O campo "Antes de cada cenário" guarda o login e o caminho até a tela, e é colocado na frente do cenário escolhido.
+
+Na API, `POST /api/generate-steps` devolve `{ scenarios: [{ title, status, steps, notes }], warnings, steps }`; `steps` só vem preenchido quando há um único cenário (o n8n manda um cenário por vez).
+
+## Conhecimento do Hub (sem IA)
+
+[`src/lib/hub-knowledge.js`](src/lib/hub-knowledge.js) guarda o que foi levantado navegando no QA: o mapa de páginas (menu → rota), as opções reais dos filtros do Banco de questões e textos de tela usados em verificações.
+
+- `Acesse "Banco de questões"` (ou `vá para`, `abra`, `navegue até`) vai direto para a rota; `Acesse /caminho` também funciona.
+- `Dado que o usuário esteja no Banco de Questões` vira navegação nativa quando a página está no mapa.
+- O organizador com IA recebe esse conhecimento e usa páginas, opções e textos reais em vez de `[informe: …]`.
+
+Se o Hub mudar uma rota, atualize o mapa; página fora do mapa cai em clique pelo texto do menu.
+
+### Robustez da execução
+
+- **Esperas reais:** em vez de tempos fixos, cada passo espera o carregamento, a rede ociosa (máx. 4s) e o fim do "Buscando…" dos autocompletes. O login espera sair da tela de login (ou o pedido de escola) e a verificação de URL aguarda o redirecionamento por até 15s.
+- **Opções de lista no popup:** a opção é clicada dentro do popup/lista, nunca num texto igual em outro ponto da página.
+- **Filtros pela URL:** em páginas que guardam filtros no endereço (`HUB_URL_FILTERS` em `hub-knowledge.js`), busca e filtros conhecidos abrem a URL já filtrada.
+- **Sem permissão = falha:** se o Hub avisar "Sem permissão" ao abrir uma página, o passo falha na hora, em vez de seguir e passar por engano numa tela vazia.

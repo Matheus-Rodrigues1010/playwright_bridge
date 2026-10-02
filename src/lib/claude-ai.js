@@ -1,8 +1,9 @@
 // Substituto do ZeroStep: executa um passo em linguagem natural usando Claude + tool use.
 // Também gera passos a partir de texto livre (generateSteps).
 import Anthropic from '@anthropic-ai/sdk';
-import { TEMPLATES, hideSecrets, restoreSecrets } from './steps.js';
+import { DEFAULT_LOGIN, DEFAULT_LOGIN_STEP, NEEDS_DATA, TEMPLATES, classifyStep, hideSecrets, restoreSecrets } from './steps.js';
 import { geminiJSON } from './gemini.js';
+import { HUB_KNOWLEDGE_PROMPT } from './hub-knowledge.js';
 
 let client; // lazy: passos nativos não exigem ANTHROPIC_API_KEY
 const MODEL = process.env.CLAUDE_MODEL || 'claude-opus-5';
@@ -98,29 +99,54 @@ export async function ai(instruction, { page }) {
   throw new Error(`Passo não concluído em ${MAX_TURNS} turnos: ${instruction}`);
 }
 
-// ===== Gerador de passos: texto livre → passos nos padrões nativos =====
+// ===== Gerador de passos: texto livre ou história de usuário → cenários com passos nos padrões nativos =====
 
-const GEN_SYSTEM = `Você converte roteiros de teste escritos livremente (com erros de digitação, abreviações, ordem confusa ou Gherkin) em passos executáveis por um robô Playwright.
+const GEN_SYSTEM = `Você converte roteiros de teste escritos livremente (com erros de digitação, abreviações, ordem confusa ou Gherkin) e histórias de usuário com critérios de aceite em cenários de teste executáveis por um robô Playwright.
 Cada passo deve seguir exatamente um destes modelos, trocando apenas os valores entre aspas duplas:
-${TEMPLATES.map(([name, t]) => `- ${name}: ${t}`).join('\n')}
+${TEMPLATES.map(([, t]) => `- ${t}`).join('\n')}
 
-Regras:
-1. Um passo por ação, na ordem descrita pelo usuário.
-2. Preserve literalmente usuários, senhas, marcadores como __SENHA_0__ ou {{QA_USER}} e textos de tela citados. Nunca invente valores.
-3. Textos de botões, menus e links vão entre aspas duplas, como aparecem na tela. Corrija erros óbvios de digitação e de acentuação do português (ex.: "admnistrador" → "Administrador", "instituiçao" → "Instituição", "usuarios" → "usuários") e registre cada correção em warnings. Não altere nomes próprios, códigos ou logins.
+Cenários:
+A. Se o texto tiver vários cenários (ex.: "Cenário 1 — ...", vários blocos Dado/Quando/Então), devolva um item em scenarios para cada um, com o título dele. Um roteiro simples vira um único cenário com title "Roteiro".
+B. Contexto, história, escopo e regras de negócio não viram passos; use-os só para entender os cenários.
+C. Não escreva login (é configurado à parte), a menos que o texto descreva o login explicitamente. Quando o texto diz "Dado que o usuário esteja em X" e X é uma página conhecida (lista abaixo), comece o cenário com Acesse "X"; se X não for conhecida, não invente navegação.
+C2. Quando faltar um valor e existir opção conhecida para aquele campo (lista abaixo), use uma opção real (ex.: Selecione "Fácil" no campo "grau de facilidade") e registre em notes qual opção escolheu. Só use [informe: ...] quando não houver opção conhecida.
+D. status de cada cenário:
+   - "ready": todos os passos têm valores concretos.
+   - "needs_data": falta algum valor (qual filtro, qual item, qual avaliação...). Escreva o passo mesmo assim, com o marcador [informe: o que falta] no lugar do valor (ex.: Selecione "[informe: disciplina]" no campo "Disciplina"), e explique em notes.
+   - "unsupported": o cenário exige enviar arquivo (upload, importação) ou verificar arquivo baixado (download, exportação). Deixe steps vazio e explique em notes.
+E. Para cenários negativos, como uma busca sem resultado, você pode criar um termo de teste claramente inexistente (ex.: "zzz-sem-resultado-teste"). Isso é dado de teste, não credencial.
+
+Regras dos passos:
+1. Um passo por ação, na ordem descrita.
+2. Preserve literalmente usuários, senhas, marcadores como __SENHA_0__ ou {{QA_USER}} e textos de tela citados (ex.: mensagens entre aspas nos critérios). Nunca invente credenciais nem textos de tela.
+3. Textos de botões, menus e links vão entre aspas duplas, como aparecem na tela. Corrija erros óbvios de digitação e de acentuação do português (ex.: "admnistrador" → "Administrador", "instituiçao" → "Instituição") e registre cada correção em warnings. Não altere nomes próprios, códigos ou logins.
 3b. Navegação encadeada ("A > B", "A e depois B", "menu A, opção B") vira um passo de clique por item, na ordem.
-4. Omita linhas que só descrevem contexto, sem ação ou verificação concreta (ex.: "Dado que estou na página de login"), e registre em warnings.
-5. Se uma ação não couber em nenhum modelo, escreva-a como instrução clara em português (ela será executada por IA) e registre em warnings.
-6. Se faltar informação necessária (ex.: login sem usuário ou senha), não invente: registre em warnings.
-Escreva os warnings em português, curtos.`;
+4. Se uma ação não couber em nenhum modelo, escreva-a como instrução clara em português (ela será executada por IA) e registre em notes.
+5. Login sem usuário ou senha informados: escreva exatamente "${DEFAULT_LOGIN_STEP}" e registre em warnings que usou o login padrão. Nunca deixe aspas vazias.
+Escreva warnings e notes em português, curtos.
+
+${HUB_KNOWLEDGE_PROMPT}`;
 
 const GEN_SCHEMA = {
   type: 'object',
   properties: {
-    steps: { type: 'array', items: { type: 'string' } },
+    scenarios: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          title: { type: 'string' },
+          status: { type: 'string', enum: ['ready', 'needs_data', 'unsupported'] },
+          steps: { type: 'array', items: { type: 'string' } },
+          notes: { type: 'array', items: { type: 'string' } },
+        },
+        required: ['title', 'status', 'steps', 'notes'],
+        additionalProperties: false,
+      },
+    },
     warnings: { type: 'array', items: { type: 'string' } },
   },
-  required: ['steps', 'warnings'],
+  required: ['scenarios', 'warnings'],
   additionalProperties: false,
 };
 
@@ -128,19 +154,49 @@ const GEN_SCHEMA = {
 const GEN_SCHEMA_GEMINI = {
   type: 'OBJECT',
   properties: {
-    steps: { type: 'ARRAY', items: { type: 'STRING' } },
+    scenarios: {
+      type: 'ARRAY',
+      items: {
+        type: 'OBJECT',
+        properties: {
+          title: { type: 'STRING' },
+          status: { type: 'STRING', enum: ['ready', 'needs_data', 'unsupported'] },
+          steps: { type: 'ARRAY', items: { type: 'STRING' } },
+          notes: { type: 'ARRAY', items: { type: 'STRING' } },
+        },
+        required: ['title', 'status', 'steps', 'notes'],
+      },
+    },
     warnings: { type: 'ARRAY', items: { type: 'STRING' } },
   },
-  required: ['steps', 'warnings'],
+  required: ['scenarios', 'warnings'],
 };
 
 // Gemini quando GEMINI_API_KEY existe; senão Claude.
+// Retorna { scenarios, warnings, steps }; steps = passos do cenário único (contrato usado pelo n8n, que manda um cenário por vez).
 export async function generateSteps(text) {
   const { hidden, secrets } = hideSecrets(text); // senhas não saem desta máquina
   const out = process.env.GEMINI_API_KEY
     ? await geminiJSON(GEN_SYSTEM, hidden, GEN_SCHEMA_GEMINI)
     : await claudeJSON(hidden);
-  return { steps: out.steps.map(s => restoreSecrets(s, secrets)), warnings: out.warnings };
+  // Rede de segurança (regra 5): login com aspas vazias ou com os placeholders padrão vira a forma legível
+  const isDefaultLogin = s => {
+    const k = classifyStep(s);
+    return /usu[aá]rio\s+""/i.test(s) || (k.kind === 'login' && k.user === DEFAULT_LOGIN.user && k.pass === DEFAULT_LOGIN.pass);
+  };
+  // Modelos às vezes prefixam o rótulo do modelo ("Ver. texto: ..."); remove para o passo casar com o padrão
+  const unlabel = s => TEMPLATES.reduce((acc, [name]) => (acc.startsWith(`${name}:`) ? acc.slice(name.length + 1).trim() : acc), s);
+  const clean = s => { const t = unlabel(restoreSecrets(s, secrets)); return isDefaultLogin(t) ? DEFAULT_LOGIN_STEP : t; };
+
+  const scenarios = out.scenarios.map(sc => {
+    const steps = sc.status === 'unsupported' ? [] : sc.steps.map(clean);
+    // Status coerente com os passos, independente do que o modelo disse
+    const status = sc.status === 'unsupported' ? 'unsupported' : steps.some(s => NEEDS_DATA.test(s)) ? 'needs_data' : steps.length ? 'ready' : 'needs_data';
+    return { title: sc.title, status, steps, notes: sc.notes };
+  });
+  const single = scenarios.length === 1 ? scenarios[0] : null;
+  // Cenário único: notes entram em warnings, como antes (o n8n mostra warnings no ClickUp)
+  return { scenarios, warnings: single ? [...out.warnings, ...single.notes] : out.warnings, steps: single ? single.steps : [] };
 }
 
 async function claudeJSON(hidden) {

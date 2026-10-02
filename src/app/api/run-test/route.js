@@ -3,7 +3,8 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import fs from 'fs/promises';
 import path from 'path';
-import { classifyStep, maskPassword } from '@/lib/steps';
+import { classifyStep, DEFAULT_LOGIN, maskPassword } from '@/lib/steps';
+import { HUB_CARD_ACTIONS, HUB_URL_FILTERS, hubPath } from '@/lib/hub-knowledge';
 import { authorized, unauthorized } from '@/lib/auth';
 import { addRun } from '@/lib/history';
 
@@ -54,6 +55,8 @@ export async function POST(request) {
     await test.step('Passo ${index + 1} - Seleção', async () => {
       try {
         const f = ${JSON.stringify(s.field)}, v = ${valueExpr(s.value)};
+        // Filtro que a página guarda na URL (ex.: grau de facilidade → ?difficultyLevel=1): abre o endereço já filtrado
+        if (await viaUrl(f, v)) return;
         // Label ligado ao input, ou o input do menor bloco que contém o texto do label (labels sem "for")
         const byBlock = page.locator('div').filter({ has: page.getByText(f) }).filter({ has: page.locator('input:visible, select:visible') }).last().locator('input:visible, select:visible').first();
         const field = page.getByLabel(f).or(page.getByPlaceholder(f)).or(page.getByRole('combobox', { name: f })).first().or(byBlock).first();
@@ -62,9 +65,52 @@ export async function POST(request) {
           await field.selectOption({ label: v });
         } else {
           await field.fill(v);
-          await page.getByRole('option', { name: v }).or(page.getByText(v, { exact: true })).first().click({ timeout: 10000 });
+          await pickOption(v);
         }
-        await page.waitForTimeout(1000);
+        await settle();
+      } finally {
+        try {
+          await page.screenshot({ path: ${JSON.stringify(stepEvidencePath)}, fullPage: true });
+        } catch (e) { console.error("Falha evidencia", e); }
+      }
+    });\n`;
+
+      } else if (s.kind === 'goto') {
+        // ===== NAVEGAÇÃO PELO MAPA DO HUB (0 créditos) =====
+        const target = s.path || hubPath(s.page);
+        stepsCode += `
+    await test.step('Passo ${index + 1} - Navegação', async () => {
+      try {
+        ${target
+          ? `await page.goto(new URL(${JSON.stringify(target)}, page.url()).href, { waitUntil: 'domcontentloaded' });`
+          : `await page.getByText(${JSON.stringify(s.page)}).first().click({ timeout: 10000 }); // fora do mapa: clica no menu`}
+        await settle();
+        // Hub avisa falta de permissão num toast e mostra a tela vazia; sem isto, verificações seguintes passariam por engano
+        const denied = page.getByText(/sem permiss[aã]o/i).first();
+        if (await denied.isVisible().catch(() => false)) {
+          throw new Error('Sem permissão nesta página para o usuário de teste: ' + (await denied.innerText()).trim());
+        }
+      } finally {
+        try {
+          await page.screenshot({ path: ${JSON.stringify(stepEvidencePath)}, fullPage: true });
+        } catch (e) { console.error("Falha evidencia", e); }
+      }
+    });\n`;
+
+      } else if (s.kind === 'cardAction') {
+        // ===== AÇÃO EM CARTÃO DE QUESTÃO DO HUB (0 créditos) =====
+        // ponytail: ícones sem nome acessível → posição no cartão (HUB_CARD_ACTIONS). Se o Hub ganhar aria-label, trocar por getByRole.
+        stepsCode += `
+    await test.step('Passo ${index + 1} - Ação na questão', async () => {
+      try {
+        await settle();
+        const title = page.getByText(/^Questão/).nth(${s.index});
+        await title.waitFor({ state: 'visible', timeout: 15000 });
+        const card = title.locator('xpath=ancestor::*[.//*[contains(@class, "IconButton-Container")]][1]');
+        const icons = card.locator('.IconButton-Container');
+        ${s.action !== 'atribuir' ? `if (await icons.count() < 2) throw new Error('Esta questão não tem a ação "${s.action}". Remover só existe em "Minhas questões", para questões da própria escola.');` : ''}
+        await icons.${HUB_CARD_ACTIONS[s.action]}().click({ timeout: 10000 });
+        await settle();
       } finally {
         try {
           await page.screenshot({ path: ${JSON.stringify(stepEvidencePath)}, fullPage: true });
@@ -107,9 +153,25 @@ export async function POST(request) {
         const submitBtn = page.locator('button[type="submit"], button:has-text("Entrar"), button:has-text("Login"), button:has-text("Acessar"), button:has-text("Avançar"), button:has-text("Sign in"), button:has-text("Continuar")').first();
         await submitBtn.click();
 
-        await page.waitForLoadState('domcontentloaded').catch(() => {});
-        await page.waitForTimeout(3000);
-
+        // Sinal real do fim do envio: saiu do login (senha some) ou o Hub pediu escola, o que vier primeiro
+        await Promise.race([
+          passField.waitFor({ state: 'hidden', timeout: 20000 }),
+          page.getByText(/escola você quer acessar/i).first().waitFor({ state: 'visible', timeout: 20000 }),
+        ]).catch(() => {});
+        await settle();
+${s.user === DEFAULT_LOGIN.user ? `
+        // Login padrão: se o site pedir escola e QA_ESCOLA existir no .env, escolhe e avança sozinho
+        if (process.env.QA_ESCOLA && await passField.isVisible().catch(() => false)) {
+          const escola = process.env.QA_ESCOLA;
+          const field = page.locator('div').filter({ has: page.getByText('escola') }).filter({ has: page.locator('input:visible') }).last().locator('input:visible').first();
+          if (await field.isVisible().catch(() => false)) {
+            await field.fill(escola);
+            await pickOption(escola);
+            await submitBtn.click();
+            await passField.waitFor({ state: 'hidden', timeout: 20000 }).catch(() => {});
+            await settle();
+          }
+        }` : ''}
 ${index === steps.length - 1 ? `
         // Formulário ainda na tela (ex: campo extra "escola") e nenhum passo seguinte → Claude conclui o login.
         if (await passField.isVisible().catch(() => false)) {
@@ -117,7 +179,7 @@ ${index === steps.length - 1 ? `
         }` : ''}
       } finally {
         try {
-          await page.waitForTimeout(1000);
+          await settle();
           await page.screenshot({ path: ${JSON.stringify(stepEvidencePath)}, fullPage: true });
         } catch (e) { console.error("Falha evidencia", e); }
       }
@@ -129,14 +191,20 @@ ${index === steps.length - 1 ? `
     await test.step('Passo ${index + 1} - Busca', async () => {
       try {
         await page.waitForLoadState('domcontentloaded').catch(() => {});
-        await page.waitForTimeout(2000);
+        await settle();
         
+        // Página que guarda a busca na URL (ex.: Banco de questões ?search=): abre o endereço já buscado
+        if (await viaUrl('search', ${valueExpr(s.term)})) return;
+
         let searchField = null;
-        
-        // Estratégia 1: campos com atributos de busca
+
+        // Estratégia 1: campos com atributos de busca, ou cujo rótulo diz "Buscar"/"Pesquisar" (Hub: label sem placeholder)
+        const byLabel = page.locator('div').filter({ has: page.getByText(/^(buscar|pesquisar|procurar|search)/i) }).filter({ has: page.locator('input:visible') }).last().locator('input:visible').first();
         const specificSearch = page.locator('input[type="search"], input[placeholder*="busc" i], input[placeholder*="pesquis" i], input[placeholder*="filtr" i], input[placeholder*="search" i], input[role="searchbox"]').first();
         if (await specificSearch.isVisible().catch(() => false)) {
           searchField = specificSearch;
+        } else if (await byLabel.isVisible().catch(() => false)) {
+          searchField = byLabel;
         }
         
         // Estratégia 2: qualquer input de texto visível (exceto senha)
@@ -159,13 +227,14 @@ ${index === steps.length - 1 ? `
         if (searchField) {
           await searchField.click();
           await searchField.fill(${valueExpr(s.term)});
-          await page.waitForTimeout(2000);
+          await searchField.press('Enter'); // buscas que só disparam no Enter (Hub)
+          await settle();
         } else {
           throw new Error('Não foi possível encontrar o campo de busca na página.');
         }
       } finally {
         try {
-          await page.waitForTimeout(1000);
+          await settle();
           await page.screenshot({ path: ${JSON.stringify(stepEvidencePath)}, fullPage: true });
         } catch (e) { console.error("Falha evidencia", e); }
       }
@@ -177,7 +246,7 @@ ${index === steps.length - 1 ? `
     await test.step('Passo ${index + 1} - Clique', async () => {
       try {
         await page.waitForLoadState('domcontentloaded').catch(() => {});
-        await page.waitForTimeout(1000);
+        await settle();
         
         const target = page.getByText(${JSON.stringify(s.text)}).first();
         await target.waitFor({ state: 'visible', timeout: 10000 });
@@ -185,10 +254,10 @@ ${index === steps.length - 1 ? `
         await target.click();
         
         await page.waitForLoadState('domcontentloaded').catch(() => {});
-        await page.waitForTimeout(2000);
+        await settle();
       } finally {
         try {
-          await page.waitForTimeout(1000);
+          await settle();
           await page.screenshot({ path: ${JSON.stringify(stepEvidencePath)}, fullPage: true });
         } catch (e) { console.error("Falha evidencia", e); }
       }
@@ -199,15 +268,16 @@ ${index === steps.length - 1 ? `
         stepsCode += `
     await test.step('Passo ${index + 1} - Verificação', async () => {
       try {
-        await page.waitForTimeout(3000);
-        
+        await settle();
+        // Redirecionamentos (ex.: após login) podem demorar: confere por até 15s antes de falhar
+        await page.waitForURL(u => u.href.includes(${JSON.stringify(s.path)}), { timeout: 15000 }).catch(() => {});
         const currentUrl = page.url();
         if (!currentUrl.includes(${JSON.stringify(s.path)})) {
           throw new Error(${JSON.stringify(`Esperava URL contendo "${s.path}" mas encontrou: `)} + currentUrl);
         }
       } finally {
         try {
-          await page.waitForTimeout(1000);
+          await settle();
           await page.screenshot({ path: ${JSON.stringify(stepEvidencePath)}, fullPage: true });
         } catch (e) { console.error("Falha evidencia", e); }
       }
@@ -220,7 +290,7 @@ ${index === steps.length - 1 ? `
     await test.step('Passo ${index + 1} - Gerar e Preencher CPF', async () => {
       try {
         await page.waitForLoadState('domcontentloaded').catch(() => {});
-        await page.waitForTimeout(1000);
+        await settle();
         
         const f = ${JSON.stringify(s.field)};
         const targetField = page.locator(\`input[placeholder*="\${f}" i], input[name*="\${f}" i], input[id*="\${f}" i]\`).first();
@@ -229,7 +299,7 @@ ${index === steps.length - 1 ? `
           await targetField.scrollIntoViewIfNeeded();
           await targetField.click();
           await targetField.fill('${generatedCpf}');
-          await page.waitForTimeout(1000);
+          await settle();
         } else {
           // Força o erro para cair no fallback se não achar via locator nativo
           throw new Error('Campo não encontrado nativamente');
@@ -239,7 +309,7 @@ ${index === steps.length - 1 ? `
         await ai(${JSON.stringify(`Preencha exatamente o valor "${generatedCpf}" no campo ${s.field}`)}, aiArgs);
       } finally {
         try {
-          await page.waitForTimeout(1000);
+          await settle();
           await page.screenshot({ path: ${JSON.stringify(stepEvidencePath)}, fullPage: true });
         } catch (e) { console.error("Falha evidencia", e); }
       }
@@ -251,11 +321,11 @@ ${index === steps.length - 1 ? `
     await test.step('Passo ${index + 1} - IA', async () => {
       try {
         await page.waitForLoadState('domcontentloaded').catch(() => {});
-        await page.waitForTimeout(1000);
+        await settle();
         await ai(${JSON.stringify(step)}, aiArgs);
       } finally {
         try {
-          await page.waitForTimeout(1000);
+          await settle();
           await page.screenshot({ path: ${JSON.stringify(stepEvidencePath)}, fullPage: true });
         } catch (e) { console.error("Falha evidencia", e); }
       }
@@ -298,6 +368,38 @@ test.afterEach(async ({ page }, testInfo) => {
 });
 
 test('Execucao dinamica do painel', async ({ page }) => {
+  // Espera real em vez de tempo fixo: carregamento, rede ociosa (máx. 4s, SPAs fazem polling) e autocomplete sem "Buscando…"
+  const settle = async () => {
+    await page.waitForLoadState('domcontentloaded').catch(() => {});
+    await page.waitForLoadState('networkidle', { timeout: 4000 }).catch(() => {});
+    await page.getByText(/^Buscando/).first().waitFor({ state: 'hidden', timeout: 30000 }).catch(() => {});
+  };
+  // Opção de lista/autocomplete: procura no popup (Hub: Portal-PopperWrapper) para não clicar no mesmo texto em outro
+  // ponto da página; a página inteira só como último recurso (popups ficam no fim do DOM, por isso .last()).
+  const pickOption = async v => {
+    await settle();
+    const popup = page.locator('[class*="PopperWrapper"]:visible, [role="listbox"]:visible');
+    const scoped = page.getByRole('option', { name: v, exact: true }).or(popup.getByText(v, { exact: true })).first();
+    await scoped.click({ timeout: 10000 }).catch(() => page.getByText(v, { exact: true }).last().click({ timeout: 5000 }));
+  };
+  // Filtro/busca que a página atual guarda na URL (HUB_URL_FILTERS): navega já filtrado. false = usar o campo.
+  const URL_FILTERS = ${JSON.stringify(HUB_URL_FILTERS)};
+  const norm = s => String(s).normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').toLowerCase().trim();
+  const viaUrl = async (field, value) => {
+    const here = new URL(page.url());
+    const rules = URL_FILTERS[here.pathname];
+    const rule = rules && Object.entries(rules).find(([k]) => norm(field).includes(norm(k)) || norm(k).includes(norm(field)))?.[1];
+    if (!rule) return false;
+    const param = typeof rule === 'string' ? rule : rule.param;
+    const val = typeof rule === 'string' ? value : rule.values[Object.keys(rule.values).find(o => norm(o) === norm(value))];
+    if (val == null) return false;
+    here.searchParams.set(param, val);
+    here.searchParams.set('page', '1');
+    await page.goto(here.href, { waitUntil: 'domcontentloaded' });
+    await settle();
+    return true;
+  };
+
   test.setTimeout(300000); // 5 minutos
   const aiArgs = { page, test };
 

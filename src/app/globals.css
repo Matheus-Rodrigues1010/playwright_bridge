@@ -586,3 +586,47 @@ input:focus, select:focus, textarea:focus {
   .history-row .step-text { flex-basis: 100%; order: 5; }
   .history-detail { padding-left: 0.25rem; }
 }
+
+/* Cenários de uma história */
+.scenarios {
+  margin-top: 1rem;
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--surface-2);
+}
+
+.scenarios-head { display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; }
+.scenarios-head strong { font-family: var(--font-fraunces), Georgia, serif; font-size: 1.1rem; }
+.scenarios textarea { background: var(--surface); }
+
+.scenario-list { list-style: none; display: flex; flex-direction: column; gap: 0.6rem; margin-top: 1rem; }
+
+.scenario-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 0.85rem 1rem;
+}
+
+.scenario-card.active { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.scenario-card.unsupported { opacity: 0.7; }
+.scenario-card .btn-secondary { margin-top: 0.6rem; }
+
+.scenario-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 0.6rem; }
+.scenario-top strong { font-size: 0.95rem; }
+
+.scenario-steps {
+  margin: 0.5rem 0 0 1.2rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.scenario-steps li + li { margin-top: 0.15rem; }
+
+.tag-ready { color: var(--success); background: var(--success-soft); }
+.tag-needs_data { color: var(--warn); background: var(--warn-soft); }
+.tag-unsupported { color: var(--muted); background: var(--surface-2); }
+
+.gen-warnings p { margin-top: 0.25rem; }
+.gen-warnings code { font-family: var(--font-geist-mono), monospace; font-size: 0.8rem; }

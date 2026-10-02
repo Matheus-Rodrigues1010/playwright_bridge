@@ -1,6 +1,10 @@
 // node src/lib/steps.test.mjs
 import assert from 'node:assert/strict';
-import { classifyStep as c, splitSteps, hideSecrets, restoreSecrets } from './steps.js';
+import { classifyStep as c, splitSteps, hideSecrets, restoreSecrets, prettyStep, NEEDS_DATA } from './steps.js';
+import { hubPath } from './hub-knowledge.js';
+
+assert.ok(NEEDS_DATA.test('Selecione "[informe: disciplina]" no campo "Disciplina"'));
+assert.ok(!NEEDS_DATA.test('Clique no botão "[Salvar]"'));
 
 // Senhas nunca vão ao Claude: escondidas e restauradas
 {
@@ -19,6 +23,27 @@ assert.equal(c('Verifique se o texto "Olá" está sendo exibido').title, false);
 assert.equal(c('Verifique se a tela /dashboard está sendo exibida').path, '/dashboard');
 assert.equal(c('Preencha um CPF válido no campo "documento"').field, 'documento');
 assert.equal(c('Abra o menu Minhas avaliações').kind, 'ai');
+// Login sem credenciais → usuário padrão do .env
+assert.deepEqual(c('faça login'), { kind: 'login', user: '{{QA_USER}}', pass: '{{QA_PASS}}' });
+assert.deepEqual(c('Quando faço o login no sistema'), { kind: 'login', user: '{{QA_USER}}', pass: '{{QA_PASS}}' });
+assert.equal(c('Verifique se o login "x" aparece').kind, 'verifyText'); // não confunde verificação com login
+assert.equal(c('faça login no hub educacional').kind, 'login');
+assert.deepEqual(c('Faça login com o usuário padrão'), { kind: 'login', user: '{{QA_USER}}', pass: '{{QA_PASS}}' });
+assert.equal(c('faça login e verifique se redireciona pra url /home').kind, 'ai'); // mais ações: não engolir a verificação
+assert.equal(c('Clique em "Relatórios" e depois clique em "Exportar"').kind, 'ai');
+assert.equal(c('Clique no botão "Clique e verifique"').kind, 'click'); // conectivo dentro de aspas não conta
+assert.equal(prettyStep('Preencha os campos de login com usuário "{{QA_USER}}" e senha "{{QA_PASS}}" e clique em Entrar'), 'Preencha os campos de login com usuário padrão e senha •••••• e clique em Entrar');
+assert.equal(prettyStep('Selecione "{{QA_ESCOLA}}" no campo "escola"'), 'Selecione QA_ESCOLA (do .env) no campo "escola"');
+// Navegação pelo mapa do Hub (src/lib/hub-knowledge.js)
+assert.deepEqual(c('Acesse "Banco de questões"'), { kind: 'goto', page: 'Banco de questões' });
+assert.deepEqual(c('vá para a página "Meus usuários"'), { kind: 'goto', page: 'Meus usuários' });
+assert.deepEqual(c('Acesse /assessments/question-bank'), { kind: 'goto', path: '/assessments/question-bank' });
+assert.deepEqual(c('Dado que o usuário esteja no Banco de Questões'), { kind: 'goto', page: 'Banco de Questões' });
+assert.equal(c('Dado que o usuário esteja numa tela qualquer').kind, 'ai'); // página desconhecida: não inventa navegação
+assert.equal(hubPath('banco de questoes'), '/assessments/question-bank'); // sem acento e minúsculo
+// Ações em cartão de questão
+assert.deepEqual(c('Na primeira questão, clique em "Remover"'), { kind: 'cardAction', action: 'remover', index: 0 });
+assert.deepEqual(c('na 3ª questão clique em atribuir'), { kind: 'cardAction', action: 'atribuir', index: 2 });
 // Gherkin (1ª pessoa + palavras-chave), como o n8n envia
 assert.deepEqual(c('Quando preencho usuário "usuario.teste" e senha "Fict1cia@9" e clico em Avançar'), { kind: 'login', user: 'usuario.teste', pass: 'Fict1cia@9' });
 assert.equal(c('Quando preencho e-mail "a@b.com" e senha "x"').user, 'a@b.com');
